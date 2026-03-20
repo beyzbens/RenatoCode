@@ -89,6 +89,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import train_test_split
 
 
@@ -171,9 +172,20 @@ class EnsembleThermalSurrogate:
     STATE_DIM = 13  # Güncellendi: 9'dan 13'e çıktı (4 yeni Delta T özelliği eklendi)
     ACTION_DIM = 4
     OUTPUT_DIM = 8
+    OUTPUT_NAMES = (
+        'zone_temp_living',
+        'zone_temp_kitchen',
+        'zone_temp_bedroom',
+        'zone_temp_bathroom',
+        'buffer_T',
+        'dhw_T',
+        'hvac_power',
+        'total_power',
+    )
 
     # Güncellendi: hidden_dim 128'den 256'ya çıkarıldı
-    def __init__(self, ensemble_size=5, hidden_dim=256, learning_rate=5e-4):
+    def __init__(self, ensemble_size=5, hidden_dim=256, learning_rate=5e-4,
+                 output_weights=None):
         self.ensemble_size = ensemble_size
         self.input_dim = self.STATE_DIM + self.ACTION_DIM
 
@@ -189,6 +201,22 @@ class EnsembleThermalSurrogate:
         self.output_mean = None
         self.output_std = None
         self._trained = False
+        self.output_weights = self._build_output_weights(output_weights)
+        self.last_split_data = None
+        self.training_history = []
+        self.best_val_loss = None
+
+    def _build_output_weights(self, output_weights):
+        if output_weights is None:
+            output_weights = np.ones(self.OUTPUT_DIM, dtype=np.float32)
+            output_weights[6] = 2.0
+            output_weights[7] = 3.0
+        weights = np.asarray(output_weights, dtype=np.float32)
+        if weights.shape != (self.OUTPUT_DIM,):
+            raise ValueError(
+                'output_weights must have shape ({},), got {}'.format(
+                    self.OUTPUT_DIM, weights.shape))
+        return weights / weights.mean()
 
     @staticmethod
     def build_features(outdoor_T, zone_temps, buffer_T, dhw_T, hour,
@@ -240,15 +268,35 @@ class EnsembleThermalSurrogate:
         self.output_mean = outputs.mean(axis=0).astype(np.float32)
         self.output_std = (outputs.std(axis=0) + 1e-8).astype(np.float32)
 
-    def fit(self, inputs, outputs, epochs=150, batch_size=256, verbose=True):
-        """Train all ensemble members with proper data splits and fixed bootstrap."""
-        
-        # 1. DÜZELTME: Veri sızıntısını önlemek için önce veriyi bölüyoruz
-        inputs_tr, inputs_val, outputs_tr, outputs_val = train_test_split(
-            inputs, outputs, test_size=0.15, random_state=42)
+    def fit(self, inputs, outputs, epochs=150, batch_size=256, verbose=True,
+            val_size=0.15, test_size=0.15, random_state=42):
+        """Train all ensemble members with train/val/test splits and fixed bootstrap."""
+
+        if val_size + test_size >= 1.0:
+            raise ValueError('val_size + test_size must be < 1.0')
+
+        inputs_tr, inputs_hold, outputs_tr, outputs_hold = train_test_split(
+            inputs, outputs, test_size=val_size + test_size,
+            random_state=random_state)
+
+        if test_size > 0.0:
+            relative_test_size = test_size / (val_size + test_size)
+            inputs_val, inputs_test, outputs_val, outputs_test = train_test_split(
+                inputs_hold, outputs_hold, test_size=relative_test_size,
+                random_state=random_state)
+        else:
+            inputs_val, outputs_val = inputs_hold, outputs_hold
+            inputs_test = np.empty((0, inputs.shape[1]), dtype=inputs.dtype)
+            outputs_test = np.empty((0, outputs.shape[1]), dtype=outputs.dtype)
 
         # İstatistikleri SADECE eğitim verisi üzerinden hesapla
         self._set_statistics(inputs_tr, outputs_tr)
+        self.last_split_data = {
+            'train': (inputs_tr, outputs_tr),
+            'val': (inputs_val, outputs_val),
+            'test': (inputs_test, outputs_test),
+        }
+        self.training_history = []
 
         # Verileri yeni istatistiklere göre normalize et
         X_tr = (inputs_tr - self.input_mean) / self.input_std
@@ -261,6 +309,8 @@ class EnsembleThermalSurrogate:
         Y_tr_t = torch.tensor(Y_tr, dtype=torch.float32)
         X_val_t = torch.tensor(X_val, dtype=torch.float32)
         Y_val_t = torch.tensor(Y_val, dtype=torch.float32)
+
+        weight_t = torch.tensor(self.output_weights, dtype=torch.float32)
 
         # 2. DÜZELTME: Bootstrap indekslerini epoch döngüsü başlamadan önce belirle
         bootstrap_indices = []
@@ -298,7 +348,8 @@ class EnsembleThermalSurrogate:
                     # Gaussian NLL Loss
                     inv_var = torch.exp(-logvar)
                     mse_term = ((mean - yb) ** 2) * inv_var
-                    loss = (mse_term + logvar).mean()
+                    weighted_nll = (mse_term + logvar) * weight_t
+                    loss = weighted_nll.mean()
 
                     # Logvar sınırlarını düzenlileştirme (Regularization)
                     loss += 0.01 * (model.max_logvar.sum() - model.min_logvar.sum())
@@ -317,9 +368,15 @@ class EnsembleThermalSurrogate:
                 for model in self.models:
                     mean, logvar = model(X_val_t)
                     inv_var = torch.exp(-logvar)
-                    val_loss = ((mean - Y_val_t)**2 * inv_var + logvar).mean()
+                    weighted_val = (((mean - Y_val_t)**2 * inv_var) + logvar) * weight_t
+                    val_loss = weighted_val.mean()
                     val_losses.append(val_loss.item())
                 avg_val_loss = np.mean(val_losses)
+            self.training_history.append({
+                'epoch': epoch + 1,
+                'train_loss': float(epoch_loss / self.ensemble_size),
+                'val_loss': float(avg_val_loss),
+            })
 
             # Early Stopping (Erken Durdurma) Kontrolü
             if avg_val_loss < best_val_loss:
@@ -341,8 +398,69 @@ class EnsembleThermalSurrogate:
 
         self.models.load_state_dict(best_state)
         self._trained = True
+        self.best_val_loss = best_val_loss
         if verbose:
             print('  Training complete. Best val loss: {:.4f}'.format(best_val_loss))
+
+    def evaluate(self, inputs, outputs, split_name='dataset'):
+        """Compute regression, residual, and uncertainty coverage metrics."""
+        if len(inputs) == 0:
+            return {
+                'split': split_name,
+                'num_samples': 0,
+                'outputs': {},
+            }
+
+        preds, unc = self.predict(inputs)
+        pred_matrix = np.column_stack([
+            preds['next_zone_temps'],
+            preds['next_buffer_T'],
+            preds['next_dhw_T'],
+            preds['hvac_power'],
+            preds['total_power'],
+        ])
+        std_matrix = unc['total_std']
+
+        metrics = {}
+        for idx, name in enumerate(self.OUTPUT_NAMES):
+            y_true = outputs[:, idx]
+            y_pred = pred_matrix[:, idx]
+            residuals = y_pred - y_true
+            sigma = std_matrix[:, idx]
+            metrics[name] = {
+                'r2': float(r2_score(y_true, y_pred)),
+                'mae': float(mean_absolute_error(y_true, y_pred)),
+                'rmse': float(np.sqrt(mean_squared_error(y_true, y_pred))),
+                'residual_mean': float(np.mean(residuals)),
+                'residual_std': float(np.std(residuals)),
+                'residual_p05': float(np.percentile(residuals, 5)),
+                'residual_p95': float(np.percentile(residuals, 95)),
+                'coverage_1sigma': float(np.mean(np.abs(residuals) <= sigma)),
+                'coverage_2sigma': float(np.mean(np.abs(residuals) <= 2.0 * sigma)),
+            }
+
+        aggregate = {
+            'mean_r2': float(np.mean([m['r2'] for m in metrics.values()])),
+            'mean_mae': float(np.mean([m['mae'] for m in metrics.values()])),
+            'mean_rmse': float(np.mean([m['rmse'] for m in metrics.values()])),
+        }
+
+        return {
+            'split': split_name,
+            'num_samples': int(len(inputs)),
+            'aggregate': aggregate,
+            'outputs': metrics,
+        }
+
+    def evaluate_splits(self):
+        """Evaluate the last train/val/test split captured during fit()."""
+        if self.last_split_data is None:
+            raise RuntimeError('No split data available. Call fit() first.')
+
+        results = {}
+        for split_name, (inputs, outputs) in self.last_split_data.items():
+            results[split_name] = self.evaluate(inputs, outputs, split_name=split_name)
+        return results
 
     @torch.no_grad()
     def predict(self, inputs):
