@@ -51,6 +51,7 @@ import sys
 import json
 import numpy as np
 import pprint
+import importlib
 import importlib.util
 import inspect
 from argparse import ArgumentParser
@@ -65,6 +66,15 @@ from flexibility_calculator import FlexibilityCalculator
 
 
 def _load_surrogate_class():
+    module_names = ('thermal_surrogate', 'agent.thermal_surrogate')
+    for module_name in module_names:
+        parent_name = module_name.split('.')[0]
+        if '.' in module_name and importlib.util.find_spec(parent_name) is None:
+            continue
+        if importlib.util.find_spec(module_name) is not None:
+            module = importlib.import_module(module_name)
+            return module.EnsembleThermalSurrogate
+
     base_dir = Path(__file__).resolve().parent
     candidate_paths = (
         base_dir / 'thermal_surrogate.py',
@@ -80,8 +90,9 @@ def _load_surrogate_class():
             return module.EnsembleThermalSurrogate
 
     raise ModuleNotFoundError(
-        'Could not locate thermal_surrogate.py. Expected either '
-        '"<project>/thermal_surrogate.py" or '
+        'Could not locate thermal_surrogate.py. Checked importable modules '
+        '"thermal_surrogate" and "agent.thermal_surrogate", plus relative '
+        'paths "<project>/thermal_surrogate.py" and '
         '"<project>/agent/thermal_surrogate.py".')
 
 
