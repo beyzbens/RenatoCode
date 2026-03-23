@@ -67,7 +67,7 @@ Duration in hours = Duration_steps × (timestep_minutes / 60)
 """
 
 import numpy as np
-from thermal_surrogate import EnsembleThermalSurrogate
+from surrogate_compat import EnsembleThermalSurrogate
 
 
 class CEMFlexibilityOptimizer:
