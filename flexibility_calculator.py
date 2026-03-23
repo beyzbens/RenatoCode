@@ -67,7 +67,32 @@ Duration in hours = Duration_steps × (timestep_minutes / 60)
 """
 
 import numpy as np
-from surrogate_compat import EnsembleThermalSurrogate
+import importlib.util
+from pathlib import Path
+
+
+def _load_surrogate_class():
+    base_dir = Path(__file__).resolve().parent
+    candidate_paths = (
+        base_dir / 'thermal_surrogate.py',
+        base_dir / 'agent' / 'thermal_surrogate.py',
+    )
+
+    for module_path in candidate_paths:
+        if module_path.exists():
+            spec = importlib.util.spec_from_file_location(
+                'loaded_thermal_surrogate', module_path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module.EnsembleThermalSurrogate
+
+    raise ModuleNotFoundError(
+        'Could not locate thermal_surrogate.py. Expected either '
+        '"<project>/thermal_surrogate.py" or '
+        '"<project>/agent/thermal_surrogate.py".')
+
+
+EnsembleThermalSurrogate = _load_surrogate_class()
 
 
 class CEMFlexibilityOptimizer:

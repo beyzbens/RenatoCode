@@ -51,15 +51,40 @@ import sys
 import json
 import numpy as np
 import pprint
+import importlib.util
 from argparse import ArgumentParser
+from pathlib import Path
 
 ep_path = r'C:\EnergyPlusV25-2-0' 
 os.environ['PATH'] = ep_path + os.pathsep + os.environ.get('PATH', '')
 
 from gym_energyplus.envs.energyplus_env import EnergyPlusEnv
 from gym_energyplus.wrappers import EnergyPlusSplitEpisodeWrapper
-from surrogate_compat import EnsembleThermalSurrogate
 from flexibility_calculator import FlexibilityCalculator
+
+
+def _load_surrogate_class():
+    base_dir = Path(__file__).resolve().parent
+    candidate_paths = (
+        base_dir / 'thermal_surrogate.py',
+        base_dir / 'agent' / 'thermal_surrogate.py',
+    )
+
+    for module_path in candidate_paths:
+        if module_path.exists():
+            spec = importlib.util.spec_from_file_location(
+                'loaded_thermal_surrogate', module_path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module.EnsembleThermalSurrogate
+
+    raise ModuleNotFoundError(
+        'Could not locate thermal_surrogate.py. Expected either '
+        '"<project>/thermal_surrogate.py" or '
+        '"<project>/agent/thermal_surrogate.py".')
+
+
+EnsembleThermalSurrogate = _load_surrogate_class()
 
 
 # ====================================================================
