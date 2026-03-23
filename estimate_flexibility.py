@@ -51,15 +51,52 @@ import sys
 import json
 import numpy as np
 import pprint
+import importlib
+import importlib.util
+import inspect
 from argparse import ArgumentParser
+from pathlib import Path
 
 ep_path = r'C:\EnergyPlusV25-2-0' 
 os.environ['PATH'] = ep_path + os.pathsep + os.environ.get('PATH', '')
 
 from gym_energyplus.envs.energyplus_env import EnergyPlusEnv
 from gym_energyplus.wrappers import EnergyPlusSplitEpisodeWrapper
-from agent.thermal_surrogate import EnsembleThermalSurrogate
 from flexibility_calculator import FlexibilityCalculator
+
+
+def _load_surrogate_class():
+    module_names = ('thermal_surrogate', 'agent.thermal_surrogate')
+    for module_name in module_names:
+        parent_name = module_name.split('.')[0]
+        if '.' in module_name and importlib.util.find_spec(parent_name) is None:
+            continue
+        if importlib.util.find_spec(module_name) is not None:
+            module = importlib.import_module(module_name)
+            return module.EnsembleThermalSurrogate
+
+    base_dir = Path(__file__).resolve().parent
+    candidate_paths = (
+        base_dir / 'thermal_surrogate.py',
+        base_dir / 'agent' / 'thermal_surrogate.py',
+    )
+
+    for module_path in candidate_paths:
+        if module_path.exists():
+            spec = importlib.util.spec_from_file_location(
+                'loaded_thermal_surrogate', module_path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module.EnsembleThermalSurrogate
+
+    raise ModuleNotFoundError(
+        'Could not locate thermal_surrogate.py. Checked importable modules '
+        '"thermal_surrogate" and "agent.thermal_surrogate", plus relative '
+        'paths "<project>/thermal_surrogate.py" and '
+        '"<project>/agent/thermal_surrogate.py".')
+
+
+EnsembleThermalSurrogate = _load_surrogate_class()
 
 
 # ====================================================================
@@ -237,6 +274,8 @@ def collect_training_data(model_file, weather_file, config,
 # ====================================================================
 
 def train_surrogate(inputs, outputs, ensemble_size=5, epochs=150,
+                    hidden_dim=256, learning_rate=5e-4,
+                    power_loss_weight=3.0, hvac_loss_weight=2.0,
                     verbose=True):
     """Train ensemble thermal surrogate model."""
     if verbose:
@@ -244,12 +283,77 @@ def train_surrogate(inputs, outputs, ensemble_size=5, epochs=150,
             ensemble_size))
         print('  Samples: {}, Input dim: {}, Output dim: {}'.format(
             len(inputs), inputs.shape[1], outputs.shape[1]))
+        print('  hidden_dim={}, learning_rate={}, hvac_loss_weight={}, total_power_loss_weight={}'.format(
+            hidden_dim, learning_rate, hvac_loss_weight, power_loss_weight))
 
-    surrogate = EnsembleThermalSurrogate(
-        ensemble_size=ensemble_size, hidden_dim=128, learning_rate=1e-3)
+    output_weights = np.ones(outputs.shape[1], dtype=np.float32)
+    output_weights[6] = hvac_loss_weight
+    output_weights[7] = power_loss_weight
+    init_signature = inspect.signature(EnsembleThermalSurrogate.__init__)
+    init_params = init_signature.parameters
+    surrogate_kwargs = {}
+
+    if 'ensemble_size' in init_params:
+        surrogate_kwargs['ensemble_size'] = ensemble_size
+    if 'hidden_dim' in init_params:
+        surrogate_kwargs['hidden_dim'] = hidden_dim
+    if 'learning_rate' in init_params:
+        surrogate_kwargs['learning_rate'] = learning_rate
+    if 'output_weights' in init_params:
+        surrogate_kwargs['output_weights'] = output_weights
+    elif verbose:
+        print('  Warning: loaded EnsembleThermalSurrogate does not support '
+              'output_weights; continuing without weighted loss.')
+
+    surrogate = EnsembleThermalSurrogate(**surrogate_kwargs)
     surrogate.fit(inputs, outputs, epochs=epochs, verbose=verbose)
 
     return surrogate
+
+
+def save_evaluation_report(surrogate, output_dir, verbose=True):
+    """Write train/val/test metrics with residual and coverage stats."""
+    report_path = os.path.join(output_dir, 'evaluation_metrics.json')
+    if not hasattr(surrogate, 'evaluate_splits'):
+        evaluation = {
+            'available': False,
+            'reason': 'Loaded surrogate implementation does not provide '
+                      'evaluate_splits().',
+        }
+        with open(report_path, 'w') as f:
+            json.dump(evaluation, f, indent=2)
+        if verbose:
+            print('\n  Evaluation summary skipped: loaded surrogate '
+                  'implementation does not provide evaluate_splits().')
+            print('  Detailed evaluation JSON: {}'.format(report_path))
+        return evaluation
+
+    evaluation = surrogate.evaluate_splits()
+    with open(report_path, 'w') as f:
+        json.dump(evaluation, f, indent=2)
+
+    if verbose:
+        print('\n  Evaluation summary:')
+        for split_name in ('train', 'val', 'test'):
+            split_metrics = evaluation[split_name]
+            total_power = split_metrics['outputs']['total_power']
+            print(
+                '    {:>5} | n={} | total_power R²={:.4f}, MAE={:.2f}, RMSE={:.2f}, '
+                'residual μ={:.2f}, σ={:.2f}, cov@1σ={:.3f}, cov@2σ={:.3f}'.format(
+                    split_name,
+                    split_metrics['num_samples'],
+                    total_power['r2'],
+                    total_power['mae'],
+                    total_power['rmse'],
+                    total_power['residual_mean'],
+                    total_power['residual_std'],
+                    total_power['coverage_1sigma'],
+                    total_power['coverage_2sigma'],
+                )
+            )
+        print('  Detailed evaluation JSON: {}'.format(report_path))
+
+    return evaluation
 
 
 # ====================================================================
@@ -340,8 +444,13 @@ def run_full_pipeline(model_file, weather_file, config, output_dir):
     surrogate = train_surrogate(
         inputs, outputs,
         ensemble_size=config.get('ensemble_size', 5),
-        epochs=config.get('train_epochs', 150))
+        epochs=config.get('train_epochs', 150),
+        hidden_dim=config.get('hidden_dim', 256),
+        learning_rate=config.get('learning_rate', 5e-4),
+        hvac_loss_weight=config.get('hvac_loss_weight', 2.0),
+        power_loss_weight=config.get('power_loss_weight', 3.0))
     surrogate.save(os.path.join(output_dir, 'surrogate.pt'))
+    evaluation = save_evaluation_report(surrogate, output_dir)
 
     # --- Step 3: Calculate ---
     print('\n' + '='*60)
@@ -368,8 +477,11 @@ def run_full_pipeline(model_file, weather_file, config, output_dir):
         'num_conditions': len(results),
         'num_training_samples': len(inputs),
         'ensemble_size': config.get('ensemble_size', 5),
+        'hidden_dim': config.get('hidden_dim', 256),
+        'learning_rate': config.get('learning_rate', 5e-4),
         'confidence_level': '95%' if config.get('confidence_beta', 1.96) == 1.96 else 'custom',
         'comfort_band': [config.get('comfort_min', 20.0), config.get('comfort_max', 26.0)],
+        'evaluation_available': bool(evaluation.get('available', True)),
         'avg_flex_up_kW': float(np.mean([r['flex_up_kW'] for r in results])),
         'max_flex_up_kW': float(np.max([r['flex_up_kW'] for r in results])),
         'avg_flex_down_kW': float(np.mean([r['flex_down_kW'] for r in results])),
@@ -379,6 +491,16 @@ def run_full_pipeline(model_file, weather_file, config, output_dir):
         'avg_duration_up_h': float(np.mean([r['duration_up_hours'] for r in results])),
         'avg_duration_down_h': float(np.mean([r['duration_down_hours'] for r in results])),
     }
+    if evaluation.get('available', True):
+        summary.update({
+            'train_total_power_r2': evaluation['train']['outputs']['total_power']['r2'],
+            'val_total_power_r2': evaluation['val']['outputs']['total_power']['r2'],
+            'test_total_power_r2': evaluation['test']['outputs']['total_power']['r2'],
+            'test_total_power_mae_W': evaluation['test']['outputs']['total_power']['mae'],
+            'test_total_power_rmse_W': evaluation['test']['outputs']['total_power']['rmse'],
+            'test_total_power_coverage_1sigma': evaluation['test']['outputs']['total_power']['coverage_1sigma'],
+            'test_total_power_coverage_2sigma': evaluation['test']['outputs']['total_power']['coverage_2sigma'],
+        })
     with open(os.path.join(output_dir, 'summary.json'), 'w') as f:
         json.dump(summary, f, indent=2)
 
@@ -413,6 +535,13 @@ def make_parser():
                        help='EnergyPlus data collection episodes (more=better model)')
     run_p.add_argument('--ensemble_size', type=int, default=5,
                        help='Number of ensemble members (5=standard)')
+    run_p.add_argument('--hidden_dim', type=int, default=256,
+                       help='Hidden width of each MLP block')
+    run_p.add_argument('--learning_rate', type=float, default=5e-4)
+    run_p.add_argument('--hvac_loss_weight', type=float, default=2.0,
+                       help='Relative loss weight for HVAC power output')
+    run_p.add_argument('--power_loss_weight', type=float, default=3.0,
+                       help='Relative loss weight for total power output')
     run_p.add_argument('--train_epochs', type=int, default=150)
     run_p.add_argument('--comfort_min', type=float, default=20.0)
     run_p.add_argument('--comfort_max', type=float, default=26.0)
@@ -448,6 +577,10 @@ if __name__ == '__main__':
             # YENİ HALİ: fallback değeri de 365 yapıldı
             'num_episodes': args.num_episodes,
             'ensemble_size': args.ensemble_size,
+            'hidden_dim': args.hidden_dim,
+            'learning_rate': args.learning_rate,
+            'hvac_loss_weight': args.hvac_loss_weight,
+            'power_loss_weight': args.power_loss_weight,
             'train_epochs': args.train_epochs,
             'comfort_min': 20.0,      
             'comfort_max': 26.0,       
