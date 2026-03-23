@@ -52,6 +52,7 @@ import json
 import numpy as np
 import pprint
 import importlib.util
+import inspect
 from argparse import ArgumentParser
 from pathlib import Path
 
@@ -277,11 +278,23 @@ def train_surrogate(inputs, outputs, ensemble_size=5, epochs=150,
     output_weights = np.ones(outputs.shape[1], dtype=np.float32)
     output_weights[6] = hvac_loss_weight
     output_weights[7] = power_loss_weight
-    surrogate = EnsembleThermalSurrogate(
-        ensemble_size=ensemble_size,
-        hidden_dim=hidden_dim,
-        learning_rate=learning_rate,
-        output_weights=output_weights)
+    init_signature = inspect.signature(EnsembleThermalSurrogate.__init__)
+    init_params = init_signature.parameters
+    surrogate_kwargs = {}
+
+    if 'ensemble_size' in init_params:
+        surrogate_kwargs['ensemble_size'] = ensemble_size
+    if 'hidden_dim' in init_params:
+        surrogate_kwargs['hidden_dim'] = hidden_dim
+    if 'learning_rate' in init_params:
+        surrogate_kwargs['learning_rate'] = learning_rate
+    if 'output_weights' in init_params:
+        surrogate_kwargs['output_weights'] = output_weights
+    elif verbose:
+        print('  Warning: loaded EnsembleThermalSurrogate does not support '
+              'output_weights; continuing without weighted loss.')
+
+    surrogate = EnsembleThermalSurrogate(**surrogate_kwargs)
     surrogate.fit(inputs, outputs, epochs=epochs, verbose=verbose)
 
     return surrogate
@@ -289,8 +302,22 @@ def train_surrogate(inputs, outputs, ensemble_size=5, epochs=150,
 
 def save_evaluation_report(surrogate, output_dir, verbose=True):
     """Write train/val/test metrics with residual and coverage stats."""
-    evaluation = surrogate.evaluate_splits()
     report_path = os.path.join(output_dir, 'evaluation_metrics.json')
+    if not hasattr(surrogate, 'evaluate_splits'):
+        evaluation = {
+            'available': False,
+            'reason': 'Loaded surrogate implementation does not provide '
+                      'evaluate_splits().',
+        }
+        with open(report_path, 'w') as f:
+            json.dump(evaluation, f, indent=2)
+        if verbose:
+            print('\n  Evaluation summary skipped: loaded surrogate '
+                  'implementation does not provide evaluate_splits().')
+            print('  Detailed evaluation JSON: {}'.format(report_path))
+        return evaluation
+
+    evaluation = surrogate.evaluate_splits()
     with open(report_path, 'w') as f:
         json.dump(evaluation, f, indent=2)
 
@@ -443,13 +470,7 @@ def run_full_pipeline(model_file, weather_file, config, output_dir):
         'learning_rate': config.get('learning_rate', 5e-4),
         'confidence_level': '95%' if config.get('confidence_beta', 1.96) == 1.96 else 'custom',
         'comfort_band': [config.get('comfort_min', 20.0), config.get('comfort_max', 26.0)],
-        'train_total_power_r2': evaluation['train']['outputs']['total_power']['r2'],
-        'val_total_power_r2': evaluation['val']['outputs']['total_power']['r2'],
-        'test_total_power_r2': evaluation['test']['outputs']['total_power']['r2'],
-        'test_total_power_mae_W': evaluation['test']['outputs']['total_power']['mae'],
-        'test_total_power_rmse_W': evaluation['test']['outputs']['total_power']['rmse'],
-        'test_total_power_coverage_1sigma': evaluation['test']['outputs']['total_power']['coverage_1sigma'],
-        'test_total_power_coverage_2sigma': evaluation['test']['outputs']['total_power']['coverage_2sigma'],
+        'evaluation_available': bool(evaluation.get('available', True)),
         'avg_flex_up_kW': float(np.mean([r['flex_up_kW'] for r in results])),
         'max_flex_up_kW': float(np.max([r['flex_up_kW'] for r in results])),
         'avg_flex_down_kW': float(np.mean([r['flex_down_kW'] for r in results])),
@@ -459,6 +480,16 @@ def run_full_pipeline(model_file, weather_file, config, output_dir):
         'avg_duration_up_h': float(np.mean([r['duration_up_hours'] for r in results])),
         'avg_duration_down_h': float(np.mean([r['duration_down_hours'] for r in results])),
     }
+    if evaluation.get('available', True):
+        summary.update({
+            'train_total_power_r2': evaluation['train']['outputs']['total_power']['r2'],
+            'val_total_power_r2': evaluation['val']['outputs']['total_power']['r2'],
+            'test_total_power_r2': evaluation['test']['outputs']['total_power']['r2'],
+            'test_total_power_mae_W': evaluation['test']['outputs']['total_power']['mae'],
+            'test_total_power_rmse_W': evaluation['test']['outputs']['total_power']['rmse'],
+            'test_total_power_coverage_1sigma': evaluation['test']['outputs']['total_power']['coverage_1sigma'],
+            'test_total_power_coverage_2sigma': evaluation['test']['outputs']['total_power']['coverage_2sigma'],
+        })
     with open(os.path.join(output_dir, 'summary.json'), 'w') as f:
         json.dump(summary, f, indent=2)
 
