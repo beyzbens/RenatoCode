@@ -58,7 +58,7 @@ os.environ['PATH'] = ep_path + os.pathsep + os.environ.get('PATH', '')
 
 from gym_energyplus.envs.energyplus_env import EnergyPlusEnv
 from gym_energyplus.wrappers import EnergyPlusSplitEpisodeWrapper
-from agent.thermal_surrogate import EnsembleThermalSurrogate
+from thermal_surrogate import EnsembleThermalSurrogate
 from flexibility_calculator import FlexibilityCalculator
 
 
